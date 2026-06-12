@@ -1,250 +1,233 @@
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
+"""e621dl — download e621 posts matching configured searches into a Drop Box folder.
 
-# Internal Imports
+Uses the v2 post API (v2=true; default mode=basic returns tags as a flat array).
+Every downloaded post ID is recorded in database.txt, so a file deleted from the
+Drop Box folder is never downloaded again.
+"""
+
+import configparser
+import datetime
+import logging
 import os
-# from distutils.version import StrictVersion
+import sys
+import time
 from fnmatch import fnmatch
 
-# External Imports
 import requests
 
-# Personal Imports
-from lib import constants
-from lib import local
-from lib import remote
-import time
-# import subprocess
-import shutil
+VERSION = '5.0.0'
+USER_AGENT = f'e621dl-M/{VERSION} (+Manual on e621)'
+POSTS_URL = 'https://e621.net/posts.json'
+PAGE_LIMIT = 320
+REQUEST_DELAY = 0.5  # e621 API allows at most 2 requests per second
+PARTIAL_EXT = '.part'
 
-print(constants.USER_AGENT)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(BASE_DIR, 'config.ini')
+DATABASE_FILE = os.path.join(BASE_DIR, 'database.txt')
 
-# This block will only be read if e621dl.py is directly executed by python. Not if it is imported.
-if __name__ == '__main__':
-    # Create the requests session that will be used throughout the run and set the user-agent.
-    # The user-agent requirements are specified at (https://e621.net/help/show/api#basics).
-    with requests.Session() as session:
-        session.headers['User-Agent'] = constants.USER_AGENT
+log = logging.getLogger('e621dl')
 
-    local.init_log()
+DEFAULT_CONFIG_TEXT = '''[Settings]
+; Destination folder (e.g. the macOS Drop Box). Created if it does not exist.
+download_directory = ~/Public/Drop Box
 
-    # Check if a new version is released on github. If so, notify the user.
-    # Not required because we're running headless
-    # if StrictVersion(constants.VERSION) < StrictVersion(remote.get_github_release(session)):
-    # local.print_log('e621dl', 'info', 'A NEW VERSION OF E621DL IS AVAILABLE ON GITHUB: (https://github.com/Wulfre/e621dl/releases/latest).')
+[Defaults]
+days = 1
+ratings = s, q, e
+min_score = -100
 
-    local.print_log('e621dl', 'info', 'Running e621dl version ' + constants.VERSION + '.')
-    local.print_log('e621dl', 'info', 'Checking for partial downloads.')
-    remote.finish_partial_downloads(session)
-    local.print_log('e621dl', 'info', 'Parsing config.')
-    config = local.get_config()
+[Blacklist]
+tags =
 
-    # Initialize the lists that will be used to filter posts.
+; Any other section is a search group:
+; [some search]
+; days = 30
+; ratings = s
+; min_score = 5
+; tags = cat, cute
+'''
+
+
+class Search:
+    def __init__(self, name, tags, ratings, min_score, earliest_date):
+        self.name = name
+        self.tags = tags
+        self.ratings = ratings
+        self.min_score = min_score
+        self.earliest_date = earliest_date
+
+
+def load_config():
+    if not os.path.isfile(CONFIG_FILE):
+        with open(CONFIG_FILE, 'wt', encoding='utf_8_sig') as outfile:
+            outfile.write(DEFAULT_CONFIG_TEXT)
+        log.error('No config file found. A default config.ini was created — add search groups to it.')
+        raise SystemExit(1)
+
+    config = configparser.ConfigParser()
+    with open(CONFIG_FILE, 'rt', encoding='utf_8_sig') as infile:
+        config.read_file(infile)
+    return config
+
+
+def parse_taglist(value):
+    return value.replace(',', ' ').lower().strip().split()
+
+
+def date_from_days(days):
+    earliest = datetime.date.today() - datetime.timedelta(days=max(days - 1, 0))
+    return max(earliest, datetime.date.fromordinal(1)).strftime('%Y-%m-%d')
+
+
+def parse_searches(config):
+    """Split the config into (download_directory, blacklist, searches)."""
+    download_directory = os.path.expanduser('~/Public/Drop Box')
     blacklist = []
+    default_days = 1
+    default_score = -0x7FFFFFFF
+    default_ratings = ['s', 'q', 'e']
     searches = []
 
-    # Initialize user configured options in case any are missing.
-    include_md5 = False  # The md5 checksum is not appended to file names.
-    default_date = local.get_date(1)  # Get posts from one day before execution.
-    default_score = -0x7FFFFFFF  # Allow posts of any score to be downloaded.
-    default_ratings = ['e']  # Allow only explicit posts to be downloaded.
-
-    # Iterate through all sections (lines enclosed in brackets: []).
     for section in config.sections():
-
-        # Get values from the "Other" section. Currently only used for file name appending.
-        if section.lower() == 'other':
-            for option, value in config.items(section):
-                if option.lower() == 'include_md5':
-                    if value.lower() == 'true':
-                        include_md5 = True
-
-        # Get values from the "Defaults" section. This overwrites the initialized default_* variables.
-        elif section.lower() == 'defaults':
-            for option, value in config.items(section):
-                if option.lower() in {'days_to_check', 'days'}:
-                    default_date = local.get_date(int(value))
-                elif option.lower() in {'min_score', 'score'}:
-                    default_score = int(value)
-                elif option.lower() in {'ratings', 'rating'}:
-                    default_ratings = value.replace(',', ' ').lower().strip().split()
-
-        # Get values from the "Blacklist" section. Tags are aliased to their acknowledged names.
-        elif section.lower() == 'blacklist':
-            blacklist = [remote.get_tag_alias(tag.lower(), session) for tag in
-                         config.get(section, 'tags').replace(',', ' ').lower().strip().split()]
-
-        # If the section name is not one of the above, it is assumed to be the values for a search.
+        name = section.lower()
+        if name == 'settings':
+            value = config.get(section, 'download_directory', fallback=None)
+            if value:
+                download_directory = os.path.expanduser(value.strip())
+        elif name == 'defaults':
+            default_days = config.getint(section, 'days', fallback=default_days)
+            default_score = config.getint(section, 'min_score', fallback=default_score)
+            if config.get(section, 'ratings', fallback=''):
+                default_ratings = parse_taglist(config.get(section, 'ratings'))
+        elif name == 'blacklist':
+            blacklist = parse_taglist(config.get(section, 'tags', fallback=''))
+        elif name == 'other':
+            pass  # legacy section, ignored
         else:
+            tags = parse_taglist(config.get(section, 'tags', fallback=''))
+            if not tags:
+                log.warning('Search [%s] has no tags, skipping.', section)
+                continue
+            days = config.getint(section, 'days', fallback=default_days)
+            min_score = config.getint(section, 'min_score', fallback=default_score)
+            ratings_value = config.get(section, 'ratings', fallback='')
+            ratings = parse_taglist(ratings_value) if ratings_value else default_ratings
+            searches.append(Search(section, tags, ratings, min_score, date_from_days(days)))
 
-            # Initialize the list of tags that will be searched.
-            section_tags = []
+    return download_directory, blacklist, searches
 
-            # Default options are set in case the user did not declare any for the specific section.
-            section_date = default_date
-            section_score = default_score
-            section_ratings = default_ratings
 
-            # Go through each option within the section to find search related values.
-            for option, value in config.items(section):
+def load_database():
+    if not os.path.isfile(DATABASE_FILE):
+        return set()
+    with open(DATABASE_FILE, 'rt') as infile:
+        return {line.strip() for line in infile if line.strip()}
 
-                # Get the tags that will be searched for. Tags are aliased to their acknowledged names.
-                if option.lower() in {'tags', 'tag'}:
-                    section_tags = [remote.get_tag_alias(tag.lower(), session) for tag in
-                                    value.replace(',', ' ').lower().strip().split()]
 
-                # Overwrite default options if the user has a specific value for the section
-                elif option.lower() in {'days_to_check', 'days'}:
-                    section_date = local.get_date(int(value))
-                elif option.lower() in {'min_score', 'score'}:
-                    section_score = int(value)
-                elif option.lower() in {'ratings', 'rating'}:
-                    section_ratings = value.replace(',', ' ').lower().strip().split()
+def record_download(post_id):
+    with open(DATABASE_FILE, 'at') as outfile:
+        outfile.write(f'{post_id}\n')
 
-            # Append the final values that will be used for the specific section to the list of searches.
-            # Note section_tags is a list within a list.
-            searches.append([section, section_tags, section_ratings, section_score, section_date])
 
-    for search in searches:
-        print('')
+def api_get(session, params):
+    params = dict(params, v2='true')
+    start = time.monotonic()
+    response = session.get(POSTS_URL, params=params)
+    elapsed = time.monotonic() - start
+    if elapsed < REQUEST_DELAY:
+        time.sleep(REQUEST_DELAY - elapsed)
+    response.raise_for_status()
+    return response.json()
 
-        # Re-assign each element of the search list to an easier to remember name. There is probably a better way.
-        directory = '.'  # I want everything in a single folder
-        tags = search[1]
-        ratings = search[2]
-        min_score = search[3]
-        earliest_date = search[4]
 
-        # Create the list that holds the title of each column in the search result table.
-        # Keeping the titles in a list allows the use of list comprehension and the sum function.
-        col_titles = ['downloaded', 'duplicate', 'rating conflict', 'blacklisted', 'missing tag']
+def get_page(session, search, last_id):
+    query = f'id:<{last_id} score:>={search.min_score} date:>={search.earliest_date} ' + ' '.join(search.tags)
+    return api_get(session, {'limit': PAGE_LIMIT, 'tags': query})
 
-        # Calculates the length of a row in the search results table including spacers so that text can be centered.
-        row_len = sum(len(x) for x in col_titles) + ((len(col_titles) * 3) - 1)
 
-        # Prints the title of the search, the titles of the results columns, and the table around it.
-        print('┌' + '─' * row_len + '┐')
-        print('│{:^{width}}│'.format(tags[0], width=row_len))
-        print('├─' + '─' * len(col_titles[0]) + '─┬─' + '─' * len(col_titles[1]) + '─┬─' + '─' * len(
-            col_titles[2]) + '─┬─' + '─' * len(col_titles[3]) + '─┬─' + '─' * len(col_titles[4]) + '─┤')
-        print('│ ' + ' │ '.join(col_titles) + ' │')
-        print('├─' + '─' * len(col_titles[0]) + '─┼─' + '─' * len(col_titles[1]) + '─┼─' + '─' * len(
-            col_titles[2]) + '─┼─' + '─' * len(col_titles[3]) + '─┼─' + '─' * len(col_titles[4]) + '─┤')
+def file_url(post):
+    url = post['files']['original'].get('url')
+    if url:
+        return url
+    # The API sometimes returns a null file URL; reconstruct it from the md5.
+    meta = post['files']['meta']
+    md5, ext = meta['md5'], meta['ext']
+    return f'https://static1.e621.net/data/{md5[:2]}/{md5[2:4]}/{md5}.{ext}'
 
-        # Initializes the results of each post in the search.
-        in_storage = 0
-        bad_rating = 0
-        blacklisted = 0
-        bad_tag = 0
-        downloaded = 0
 
-        # Creates the string to be sent to the API.
-        # Currently only 4 items can be sent directly so the rest are discarded to be filtered out later.
-        if len(tags) > 4:
-            search_string = ' '.join(tags[:4])
-        else:
-            search_string = ' '.join(tags)
+def download_post(session, post, directory):
+    ext = post['files']['meta']['ext']
+    timestamp = time.strftime('%Y%m%d_%H%M%S_', time.localtime())
+    path = os.path.join(directory, f"{timestamp}{post['id']}.{ext}")
+    partial = path + PARTIAL_EXT
 
-        # Initializes last_id (the last post found in a search) to an enormous number so that the newest post will be found.
-        # This number is hard-coded because on 64-bit archs, sys.maxsize() will return a number too big for e621 to use.
-        last_id = 0x7FFFFFFF
+    response = session.get(file_url(post), stream=True)
+    response.raise_for_status()
+    with open(partial, 'wb') as outfile:
+        for chunk in response.iter_content(chunk_size=65536):
+            outfile.write(chunk)
+    os.rename(partial, path)
 
-        # Sets up a loop that will continue indefinitely until the last post of a search has been found.
-        while True:
-            if search_string == "dnp_flagged":
-                results = remote.get_dnp_flagged_posts(last_id, session)
+
+def clean_partial_downloads(directory):
+    for entry in os.listdir(directory):
+        if entry.endswith(PARTIAL_EXT):
+            log.info('Removing incomplete download: %s', entry)
+            os.remove(os.path.join(directory, entry))
+
+
+def run_search(session, search, blacklist, database, directory):
+    downloaded = in_storage = bad_rating = blacklisted = 0
+    last_id = 0x7FFFFFFF
+
+    while True:
+        posts = get_page(session, search, last_id)
+
+        for post in posts:
+            if str(post['id']) in database:
+                in_storage += 1
+            elif post['rating'] not in search.ratings:
+                bad_rating += 1
+            elif any(fnmatch(tag, pattern) for tag in post['tags'] for pattern in blacklist):
+                blacklisted += 1
             else:
-                results = remote.get_posts(search_string, min_score, earliest_date, last_id, session)
+                download_post(session, post, directory)
+                database.add(str(post['id']))
+                record_download(post['id'])
+                downloaded += 1
 
-            # Gets the id of the last post found in the search so that the search can continue.
-            # If the number of results is less than the max, the next searches will always return 0 results.
-            # Because of this, the last id is set to 0 which is the base case for exiting the while loop.
-            if len(results) < constants.MAX_RESULTS:
-                last_id = 0
-            else:
-                last_id = results[-1]['id']
+        if len(posts) < PAGE_LIMIT:
+            break
+        last_id = posts[-1]['id']
 
-            # This dummy result makes sure that the for loop is always executed even for 0 real results.
-            # This is so the table will print 0.
-            dummy_id = 'There is no way this dummy will ever break as a long string. Probably.'
-            results['posts'].append({'id': dummy_id, 'file': {'md5': dummy_id, 'ext': dummy_id}})
+    log.info('[%s] downloaded %d, already saved %d, wrong rating %d, blacklisted %d',
+             search.name, downloaded, in_storage, bad_rating, blacklisted)
 
-            for post in results['posts']:
-                isotime = time.strftime("%Y%m%d_%H%M%S_", time.localtime())
-                if post['id'] is not dummy_id:
-                    post_tags = [item for sublist in post['tags'].values() for item in sublist]
-                if include_md5:
-                    path = local.make_path(directory, isotime + str(post['file']['md5']), post['file']['ext'])
-                else:
-                    path = local.make_path(directory, isotime + str(post['id']), post['file']['ext'])
 
-                if post['id'] == dummy_id:
-                    pass
-                elif str(post['id']) in open('database.txt', 'r').read():
-                    in_storage += 1
-                elif post['rating'] not in ratings:
-                    bad_rating += 1
+def main():
+    logging.basicConfig(level=logging.INFO, format='%(name)-7s %(levelname)-8s %(message)s')
+    log.info('Running e621dl %s', VERSION)
 
-                # Using fnmatch allows for wildcards to be properly filtered.
-                elif [x for x in post_tags if any(fnmatch(x, y) for y in blacklist)]:
-                    blacklisted += 1
-                elif not set(tags[4:]).issubset(post_tags):
-                    bad_tag += 1
-                else:
-                    # so apparently the new e621 can just decide to return a null file URL for no reason. Fun!
-                    # attempt to guess the proper URL and hope that it works
-                    if post['file']['url'] == None:
-                        post['file']['url'] = f"https://static1.e621.net/data/{post['file']['md5'][:2]}/{post['file']['md5'][2:4]}/{post['file']['md5']}.{post['file']['ext']}"
-                    downloaded += 1
-                    if search_string != "dnp_flagged":
-                        open('database.txt', 'a').write(str(post['id']) + '\n')
-                    remote.download_post(local.make_url(post['file']['md5'], post['file']['ext']), path, session)
+    config = load_config()
+    directory, blacklist, searches = parse_searches(config)
+    if not searches:
+        log.error('No search groups defined in config.ini.')
+        raise SystemExit(1)
 
-                    # FFmpeg transcode webm to mp4
-                    # if str(path[-4:]) == "webm":
-                    #     ffmpeg = subprocess.Popen(["/usr/local/bin/ffmpeg", "-i", path, "-tune", "animation", "-preset", "fast", path[:-4] + 'mp4'],stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    #     ffmpeg.wait()
-                    #     (stdout, stderr) = ffmpeg.communicate()
+    os.makedirs(directory, exist_ok=True)
+    clean_partial_downloads(directory)
+    database = load_database()
+    log.info('Saving to %s (%d posts already in database)', directory, len(database))
 
-                    # oldpath = path
-                    # path = path[:-4] + 'mp4'
+    with requests.Session() as session:
+        session.headers['User-Agent'] = USER_AGENT
+        for search in searches:
+            run_search(session, search, blacklist, database, directory)
 
-                    # if ffmpeg.returncode != 0:
-                    #     print(stderr)
-                    #     path = oldpath
-                    # else:
-                    #     os.remove(oldpath)
+    log.info('All searches complete.')
 
-                # Prints the numerical values of the search results.
-                print('│ {:^{width0}} │ {:^{width1}} │ {:^{width2}} │ {:^{width3}} │ {:^{width4}} │'.format(
-                    str(downloaded), str(in_storage), str(bad_rating), str(blacklisted), str(bad_tag),
-                    width0=len(col_titles[0]), width1=len(col_titles[1]), width2=len(col_titles[2]),
-                    width3=len(col_titles[3]), width4=len(col_titles[4])
-                ), end='\r', flush=True)
 
-            # Print bottom of table. Break while loop. End program.
-            if last_id == 0:
-                print('')
-                print('└─' + '─' * len(col_titles[0]) + '─┴─' + '─' * len(col_titles[1]) + '─┴─' + '─' * len(
-                    col_titles[2]) + '─┴─' + '─' * len(col_titles[3]) + '─┴─' + '─' * len(col_titles[4]) + '─┘')
-
-                break
-
-# OneDrive integration
-# onedrive = subprocess.Popen(["/usr/bin/rclone", "move", "/home/manual/e621dl/downloads", "onedrive:downloads"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-# onedrive.wait()
-# (stdout, stderr) = onedrive.communicate()
-
-# Local FS integration
-# source_dir = '/Users/ixion/Projects/e621dl/downloads'
-# target_dir = '/Users/ixion/Yiff/downloads'
-
-# file_names = os.listdir(source_dir)
-
-# for file_name in file_names:
-#     if file_name.startswith("."):
-#         continue
-#     shutil.move(os.path.join(source_dir, file_name), target_dir)
-
-print('')
-print('All searches complete.')
-raise SystemExit
+if __name__ == '__main__':
+    main()
