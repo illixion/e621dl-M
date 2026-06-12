@@ -53,7 +53,7 @@ def get_dnp_flagged_posts(last_id, session):
     flags_response.raise_for_status()
 
     for item in flags_response.json():
-        if "paysite" in item['reason'] and item['is_deletion'] is False and str(item['post_id']) not in open('database.txt', 'r').read():
+        if "paysite" in item['reason'].lower() and item['is_deletion'] is False and str(item['post_id']) not in open('database.txt', 'r').read():
             posts = get_known_post(item['post_id'], session)['posts']
             if len(posts) == 1:
                 faux_search_results['posts'].append(posts[0])
@@ -86,7 +86,7 @@ def get_tag_alias(user_tag, session):
         user_tag = user_tag[1:]
 
     url = 'https://e621.net/tags.json'
-    payload = {'search[name]': user_tag}
+    payload = {'search[name_matches]': user_tag}
 
     response = delayed_post(url, payload, session)
     response.raise_for_status()
@@ -99,9 +99,10 @@ def get_tag_alias(user_tag, session):
     if user_tag == 'dnp_flagged':
         return user_tag
 
-    for tag in results:
-        if user_tag == tag['name']:
-            return prefix + user_tag
+    if 'tags' not in results:
+        for tag in results:
+            if user_tag == tag['name']:
+                return prefix + user_tag
 
     url = 'https://e621.net/tag_aliases.json'
     payload = {'search[antecedent_name]': user_tag}
@@ -154,7 +155,7 @@ def download_post(url, path, session):
     os.rename(path, path.replace('.' + constants.PARTIAL_DOWNLOAD_EXT, ''))
 
 def finish_partial_downloads(session):
-    for root, dirs, files in os.walk('downloads/'):
+    for root, dirs, files in os.walk('/Users/ixion/Projects/e621dl/downloads'):
         for file in files:
             if file.endswith(constants.PARTIAL_DOWNLOAD_EXT):
                 local.print_log('remote', 'info', 'Partial download found: ' + file + '.')

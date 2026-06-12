@@ -72,7 +72,10 @@ def substitute_illegals(char):
 def make_path(dir_name, filename, ext):
     clean_dir_name = ''.join([substitute_illegals(char) for char in dir_name]).lower()
 
-    if not os.path.isdir('downloads/' + clean_dir_name):
-        os.makedirs('downloads/' + clean_dir_name)
+    if not os.path.isdir('/Users/ixion/Projects/e621dl/downloads/' + clean_dir_name):
+        os.makedirs('/Users/ixion/Projects/e621dl/downloads/' + clean_dir_name)
 
-    return 'downloads/' + clean_dir_name + '/' + filename + '.' + ext
+    return '/Users/ixion/Projects/e621dl/downloads/' + clean_dir_name + '/' + filename + '.' + ext
+
+def make_url(md5, ext):
+    return 'https://static1.e621.net/data/' + md5[0:2] + '/' + md5[2:4] + '/' + md5 + '.' + ext

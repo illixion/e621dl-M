@@ -2,7 +2,6 @@
 
 # Internal Imports
 import os
-from time import sleep
 # from distutils.version import StrictVersion
 from fnmatch import fnmatch
 
@@ -14,7 +13,8 @@ from lib import constants
 from lib import local
 from lib import remote
 import time
-import subprocess
+# import subprocess
+import shutil
 
 print(constants.USER_AGENT)
 
@@ -22,17 +22,17 @@ print(constants.USER_AGENT)
 if __name__ == '__main__':
     # Create the requests session that will be used throughout the run and set the user-agent.
     # The user-agent requirements are specified at (https://e621.net/help/show/api#basics).
-  with requests.Session() as session:
-    session.headers['User-Agent'] = constants.USER_AGENT
+    with requests.Session() as session:
+        session.headers['User-Agent'] = constants.USER_AGENT
 
     local.init_log()
 
     # Check if a new version is released on github. If so, notify the user.
-    # Removed for reasons.
+    # Not required because we're running headless
     # if StrictVersion(constants.VERSION) < StrictVersion(remote.get_github_release(session)):
     # local.print_log('e621dl', 'info', 'A NEW VERSION OF E621DL IS AVAILABLE ON GITHUB: (https://github.com/Wulfre/e621dl/releases/latest).')
 
-    local.print_log('e621dl', 'info', 'Running e621dl-M version ' + constants.VERSION + '.')
+    local.print_log('e621dl', 'info', 'Running e621dl version ' + constants.VERSION + '.')
     local.print_log('e621dl', 'info', 'Checking for partial downloads.')
     remote.finish_partial_downloads(session)
     local.print_log('e621dl', 'info', 'Parsing config.')
@@ -179,14 +179,13 @@ if __name__ == '__main__':
 
                 if post['id'] == dummy_id:
                     pass
-                elif post['file']['md5'] in open('database.txt', 'r').read():
+                elif str(post['id']) in open('database.txt', 'r').read():
                     in_storage += 1
                 elif post['rating'] not in ratings:
                     bad_rating += 1
 
                 # Using fnmatch allows for wildcards to be properly filtered.
                 elif [x for x in post_tags if any(fnmatch(x, y) for y in blacklist)]:
-                    print(post['id'])
                     blacklisted += 1
                 elif not set(tags[4:]).issubset(post_tags):
                     bad_tag += 1
@@ -197,8 +196,23 @@ if __name__ == '__main__':
                         post['file']['url'] = f"https://static1.e621.net/data/{post['file']['md5'][:2]}/{post['file']['md5'][2:4]}/{post['file']['md5']}.{post['file']['ext']}"
                     downloaded += 1
                     if search_string != "dnp_flagged":
-                        open('database.txt', 'a').write(post['file']['md5'] + '\n')
-                    remote.download_post(post['file']['url'], path, session)
+                        open('database.txt', 'a').write(str(post['id']) + '\n')
+                    remote.download_post(local.make_url(post['file']['md5'], post['file']['ext']), path, session)
+
+                    # FFmpeg transcode webm to mp4
+                    # if str(path[-4:]) == "webm":
+                    #     ffmpeg = subprocess.Popen(["/usr/local/bin/ffmpeg", "-i", path, "-tune", "animation", "-preset", "fast", path[:-4] + 'mp4'],stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    #     ffmpeg.wait()
+                    #     (stdout, stderr) = ffmpeg.communicate()
+
+                    # oldpath = path
+                    # path = path[:-4] + 'mp4'
+
+                    # if ffmpeg.returncode != 0:
+                    #     print(stderr)
+                    #     path = oldpath
+                    # else:
+                    #     os.remove(oldpath)
 
                 # Prints the numerical values of the search results.
                 print('│ {:^{width0}} │ {:^{width1}} │ {:^{width2}} │ {:^{width3}} │ {:^{width4}} │'.format(
@@ -215,7 +229,22 @@ if __name__ == '__main__':
 
                 break
 
-    # End program.
+# OneDrive integration
+# onedrive = subprocess.Popen(["/usr/bin/rclone", "move", "/home/manual/e621dl/downloads", "onedrive:downloads"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+# onedrive.wait()
+# (stdout, stderr) = onedrive.communicate()
+
+# Local FS integration
+# source_dir = '/Users/ixion/Projects/e621dl/downloads'
+# target_dir = '/Users/ixion/Yiff/downloads'
+
+# file_names = os.listdir(source_dir)
+
+# for file_name in file_names:
+#     if file_name.startswith("."):
+#         continue
+#     shutil.move(os.path.join(source_dir, file_name), target_dir)
+
 print('')
 print('All searches complete.')
 raise SystemExit
